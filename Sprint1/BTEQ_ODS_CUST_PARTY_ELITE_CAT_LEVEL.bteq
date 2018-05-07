@@ -1,0 +1,461 @@
+#!/usr/bin/ksh
+#####################################################################################
+# LATAM WCBI                                                                  		#
+# Nombre del proceso        : BTEQ_ODS_CUST_PARTY_ELITE_CAT_LEVEL.bteq           	#
+# Descripcion del proceso   : Carga relacion Cliente y categorias FFP               #
+# Autor                     : Leonardo Angelucci                             		#
+# Empresa					: Teradata										 		#
+# Fecha                     : 17-04-2018                                     		#
+#####################################################################################
+
+. /data/DESA/app/PHBICI/CNF/ConfigLocal.sh
+
+PUB_DT=$1;                                                                           export PUB_DT;   # Fecha de Proceso
+LOAD_ID=$2;                                                                          export LOAD_ID;  # Id de Carga
+PUB_END_DT=$3;																		 export PUB_END_DT; # Fin Fecha de Proceso
+
+
+###############################################################################
+# VARIABLES LOCALES DEL PROCESO                                               #
+###############################################################################
+
+FECHA_HORA_PROCESO=`date +%Y%m%d"_"%H%M%S`;                                 export FECHA_HORA_PROCESO;   # Fecha/Hora del Proceso
+LOAD_DTTM=`date +%Y%m%d""%H%M%S`;                                          	export LOAD_DTTM;   		 # Fecha/Hora del Proceso (sin _)
+LOG_BTEQ=${PRMF_PATH_LOG}/BTEQ_ODS_CUST_PARTY_ELITE_CAT_LEVEL_${FECHA_HORA_PROCESO}.log;  export LOG_BTEQ;             # Archivo Log del Proceso
+
+
+bteq<< FIN_BTEQ>${LOG_BTEQ}
+.LOGON ${PRMF_TERA_HOST}/${PRMF_TERA_USER},${PRMF_TERA_PASS}
+
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+SET QUERY_BAND = 'Proy=WCBI;BTEQ=BTEQ_ODS_CUST_PARTY_ELITE_CAT_LEVEL;' FOR SESSION;
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/*** INICIO BTEQ ***/
+
+
+
+/* --------------------------------------------------------------------------------
+	QUITA SOLAPAMIENTOS PARA CADA CATEGORIA
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_CATEGORY_LEVEL,
+NO FALLBACK,
+NO Log
+(
+	  Category_Type_Cd SMALLINT NOT NULL
+	, Category_Level_Cd CHAR(3) CHARACTER	SET Latin NOT CaseSpecific NOT NULL
+	, Party_Categ_Level_Start_Dttm TIMESTAMP(0) NOT NULL
+	, Party_Id INTEGER NOT NULL
+	, Party_Categ_Level_End_Dttm TIMESTAMP(0)
+)
+PRIMARY INDEX ( Party_Id )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL FOR ACCESS
+
+INSERT INTO VLTL_CATEGORY_LEVEL	
+(
+	  Category_Type_Cd 
+	, Category_Level_Cd 
+	, Party_Categ_Level_Start_Dttm 
+	, Party_Id
+	, Party_Categ_Level_End_Dttm 
+)	
+	SELECT
+		bhv.Category_Type_Cd
+		, bhv.Category_Level_Cd
+		, bhv.Party_Categ_Level_Start_Dt
+		, bhv.Party_Id
+		, bhv.Fixed_Party_Categ_Level_End_Dt
+	FROM
+	(
+		SELECT
+			  Category_Type_Cd
+			, Category_Level_Cd
+			, Cast(Party_Categ_Level_Start_Dttm AS DATE) AS Party_Categ_Level_Start_Dt
+			, Party_Id
+			, Coalesce(Party_Categ_Level_End_Dttm, Cast('9999-12-31' AS DATE)) AS Party_Categ_Level_End_Dt
+			, Coalesce(Max(Party_Categ_Level_Start_Dttm) Over (PARTITION BY Category_Type_Cd, Category_Level_Cd, Party_Id ORDER BY Party_Categ_Level_Start_Dttm, Party_Categ_Level_End_Dttm ROWS BETWEEN 1 Following AND 1 Following), Cast('9999-12-31' AS DATE)) AS Next_Party_Categ_Level_End_Dt
+			, CASE WHEN Party_Categ_Level_End_Dt < Next_Party_Categ_Level_End_Dt THEN
+				Party_Categ_Level_End_Dt
+			  WHEN Next_Party_Categ_Level_End_Dt = '9999-12-31' THEN
+				Next_Party_Categ_Level_End_Dt
+			  ELSE
+				Next_Party_Categ_Level_End_Dt - 1
+			  END AS Fixed_Party_Categ_Level_End_Dt
+		FROM ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL 
+		WHERE Category_Type_Cd IN (7, 11)
+	) bhv
+	WHERE bhv.Fixed_Party_Categ_Level_End_Dt >= bhv.Party_Categ_Level_Start_Dt
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	QUITA SOLAPAMIENTOS PARA CADA PARTY_ID
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_CATEGORY_LEVEL_FIXED,
+NO FALLBACK,
+NO LOG
+(
+	  Category_Type_Cd SMALLINT NOT NULL
+	, Category_Level_Cd CHAR(3) CHARACTER	SET Latin NOT CaseSpecific NOT NULL
+	, Party_Categ_Level_Start_Dttm TIMESTAMP(0) NOT NULL
+	, Party_Id INTEGER NOT NULL
+	, Party_Categ_Level_End_Dttm TIMESTAMP(0)
+)
+PRIMARY INDEX ( Party_Id )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+INSERT INTO VLTL_CATEGORY_LEVEL_FIXED
+(
+	  Category_Type_Cd 
+	, Category_Level_Cd 
+	, Party_Categ_Level_Start_Dttm 
+	, Party_Id
+	, Party_Categ_Level_End_Dttm 
+)
+	SELECT
+		bhv.Category_Type_Cd
+		, bhv.Category_Level_Cd
+		, bhv.Party_Categ_Level_Start_Dt
+		, bhv.Party_Id
+		, bhv.Fixed_Party_Categ_Level_End_Dt
+	FROM
+	(
+		SELECT
+			Category_Type_Cd
+			, Category_Level_Cd
+			, Cast(Party_Categ_Level_Start_Dttm AS DATE) AS Party_Categ_Level_Start_Dt
+			, Party_Id
+			, Coalesce(Party_Categ_Level_End_Dttm, Cast('9999-12-31' AS DATE)) AS Party_Categ_Level_End_Dt
+			, Coalesce(Max(Party_Categ_Level_Start_Dttm) Over (PARTITION BY Party_Id ORDER BY Party_Categ_Level_Start_Dttm, Party_Categ_Level_End_Dttm, Category_Type_Cd, Category_Level_Cd ROWS BETWEEN 1 Following AND 1 Following), Cast('9999-12-31' AS DATE)) AS Next_Party_Categ_Level_End_Dt
+			, CASE WHEN Party_Categ_Level_End_Dt < Next_Party_Categ_Level_End_Dt THEN
+				Party_Categ_Level_End_Dt
+			  WHEN Next_Party_Categ_Level_End_Dt = '9999-12-31' THEN
+				Next_Party_Categ_Level_End_Dt
+			  ELSE
+				Next_Party_Categ_Level_End_Dt - 1
+			  END AS Fixed_Party_Categ_Level_End_Dt
+		FROM VLTL_CATEGORY_LEVEL
+	) bhv
+	WHERE bhv.Fixed_Party_Categ_Level_End_Dt >= bhv.Party_Categ_Level_Start_Dt
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CREO TABLAS VOLATILES DE TRABAJO PARA CARGAR RELACION CLIENTE Y CATEGORIA
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_PARTY_CATEGORY_LEVEL,
+NO FALLBACK,
+NO LOG
+(
+	  Party_Id INTEGER NOT NULL
+	, Party_Categ_Level_Start_Dt DATE Format 'YYYY-MM-DD' NOT NULL
+	, Party_Categ_Level_End_Dt DATE Format 'YYYY-MM-DD' NOT NULL
+	, Elite_Category_Lvl_Cd SMALLINT NOT NULL
+    , Row_Instance_Order DECIMAL(4,1) not null
+    , Publish_Dt DATE Format 'YYYY-MM-DD' NOT NULL
+    , Source_Data_Feed_Id INTEGER NOT NULL
+)
+PRIMARY INDEX ( Party_Id )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL DE CATEGORIAS ELITE FFP EN ODS
+-----------------------------------------------------------------------------------*/
+
+INSERT INTO VLTL_PARTY_CATEGORY_LEVEL
+(
+   Party_Id,
+   Party_Categ_Level_Start_Dt,
+   Party_Categ_Level_End_Dt,
+   Elite_Category_Lvl_Cd,
+   Row_Instance_Order,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT 
+   Party_Id,
+   Party_Categ_Level_Start_Dttm (DATE) AS Party_Categ_Level_Start_Dt,
+   Party_Categ_Level_End_Dttm (DATE) AS Party_Categ_Level_End_Dt,
+   CASE 
+      WHEN Category_Type_Cd = 11 THEN Category_Level_Cd 
+      WHEN Category_Type_Cd = 7 AND Category_Level_Cd = 4 THEN 1 --BLACK SIGNATURE
+      WHEN Category_Type_Cd = 7 AND Category_Level_Cd = 1 THEN 2 --BLACK
+      WHEN Category_Type_Cd = 7 AND Category_Level_Cd = 2 THEN 3 --PLATINUM
+      WHEN Category_Type_Cd = 7 AND Category_Level_Cd = 3 THEN 4 --GOLD
+      WHEN Category_Type_Cd = 7 AND Category_Level_Cd = 5 THEN 5 --LATAM
+      ELSE -99
+   END (SMALLINT) AS Elite_Category_Lvl_Cd,
+   Row_Number() Over(PARTITION BY Party_Id ORDER BY Party_Categ_Level_Start_Dt,Party_Categ_Level_End_Dt ) AS Row_Instance_Order,
+   Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+   2037 AS Source_Data_Feed_Id
+   
+FROM VLTL_CATEGORY_LEVEL_FIXED
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ELIMINO TABLAS VOLATILES
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_CATEGORY_LEVEL_FIXED;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+DROP TABLE VLTL_CATEGORY_LEVEL;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL CON LA CATEGORIA INICIAL PARA LA HISTORIA
+-----------------------------------------------------------------------------------*/
+
+INSERT INTO VLTL_PARTY_CATEGORY_LEVEL
+(
+   Party_Id,
+   Party_Categ_Level_Start_Dt,
+   Party_Categ_Level_End_Dt,
+   Elite_Category_Lvl_Cd,
+   Row_Instance_Order,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT
+   Party_Id,
+   ('1900-01-01' (DATE)) AS Party_Categ_Level_Start_Dt,
+   Min(Party_Categ_Level_Start_Dt)-1 AS Party_Categ_Level_End_Dt,
+   5 AS Elite_Category_Lvl_Cd, --LATAM
+   0 AS Row_Instance_Order,
+   Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+   2037 AS Source_Data_Feed_Id
+
+FROM VLTL_PARTY_CATEGORY_LEVEL
+
+WHERE 
+   Party_Id IN 
+      ( SELECT Party_Id FROM VLTL_PARTY_CATEGORY_LEVEL WHERE Party_Categ_Level_Start_Dt <> ('1900-01-01' (DATE)))
+
+GROUP BY 
+   Party_Id
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL CON LA CATEGORIA FINAL PARA LA BAJADA
+-----------------------------------------------------------------------------------*/
+
+
+INSERT INTO VLTL_PARTY_CATEGORY_LEVEL
+(
+   Party_Id,
+   Party_Categ_Level_Start_Dt,
+   Party_Categ_Level_End_Dt,
+   Elite_Category_Lvl_Cd,
+   Row_Instance_Order,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT
+   Party_Id,
+   Party_Categ_Level_End_Dt+1 AS Party_Categ_Level_Start_Dt,
+   ('9999-12-31' (DATE))  AS Party_Categ_Level_End_Dt,
+   5 AS Elite_Category_Lvl_Cd, --LATAM
+   Row_Instance_Order+1 AS Row_Instance_Order,
+   Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+   2037 AS Source_Data_Feed_Id
+
+FROM VLTL_PARTY_CATEGORY_LEVEL
+
+WHERE  Party_Id  NOT IN 
+      ( SELECT Party_Id FROM VLTL_PARTY_CATEGORY_LEVEL WHERE Party_Categ_Level_End_Dt = ('9999-12-31' (DATE)) )
+
+QUALIFY (
+Row_Number() Over(PARTITION BY Party_Id ORDER BY Row_Instance_Order DESC)
+) = 1
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL CON LAS INSTANCIAS FALTANTES CON CATEGORIA LATAM (BASE)
+-----------------------------------------------------------------------------------*/
+
+INSERT INTO VLTL_PARTY_CATEGORY_LEVEL
+(
+   Party_Id,
+   Party_Categ_Level_Start_Dt,
+   Party_Categ_Level_End_Dt,
+   Elite_Category_Lvl_Cd,
+   Row_Instance_Order,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT
+   BASE.Party_id,
+   BASE.Party_Categ_Level_End_Dt+1 AS Party_Categ_Level_Start_Dt,
+   SIGU.Party_Categ_Level_Start_Dt-1 AS Party_Categ_Level_End_Dt,
+   5 AS Elite_Category_Lvl_Cd, -- LATAM
+   (BASE.Row_Instance_Order+0.5) AS Row_Instance_Order,
+   Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+   2037 AS Source_Data_Feed_Id
+   
+FROM 
+   (
+   SELECT
+      a.Party_id,
+      a.Party_Categ_Level_Start_Dt,
+      a.Party_Categ_Level_End_Dt,
+      a.Row_Instance_order 
+   
+   FROM VLTL_PARTY_CATEGORY_LEVEL A 
+   
+   LEFT OUTER JOIN VLTL_PARTY_CATEGORY_LEVEL B 
+      ON A.Party_id  = B.Party_id
+      AND A.Party_Categ_Level_End_Dt +1 = B.Party_Categ_Level_Start_Dt
+   
+   WHERE 
+      A.Party_Categ_Level_End_Dt <> ('9999-12-31' (DATE)) 
+      AND B.Party_id IS NULL
+   ) BASE
+
+INNER JOIN VLTL_PARTY_CATEGORY_LEVEL SIGU
+   ON BASE.Party_id = SIGU.Party_id
+   AND BASE.Row_Instance_order = SIGU.Row_Instance_order-1
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	COLECTO ESTADISTICAS A LA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS 
+   COLUMN (Elite_Category_Lvl_Cd),
+   COLUMN (Party_Id),
+   COLUMN (Party_Id, Party_Categ_Level_Start_Dt, Party_Categ_Level_End_Dt),
+   COLUMN (Party_Categ_Level_Start_Dt),
+   COLUMN (Party_Categ_Level_End_Dt),
+   COLUMN (PARTITION)
+ON VLTL_PARTY_CATEGORY_LEVEL;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ACTUALIZO LA TABLA  FINAL ODS CON INSERT / UPDATE, NO APLICA MERGE
+-----------------------------------------------------------------------------------*/
+
+BEGIN TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.PARTY_ELITE_CATEGORY_LEVEL FOR ACCESS
+
+DELETE 
+FROM ${PRMF_TERA_DB_ODS}.PARTY_ELITE_CATEGORY_LEVEL 
+WHERE PARTY_ID IN (
+SELECT PARTY_ID FROM VLTL_PARTY_CATEGORY_LEVEL GROUP BY PARTY_ID
+)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.PARTY_ELITE_CATEGORY_LEVEL FOR WRITE
+
+INSERT INTO ${PRMF_TERA_DB_ODS}.PARTY_ELITE_CATEGORY_LEVEL
+(
+	Party_Id,
+	Party_Categ_Level_Start_Dt,
+	Party_Categ_Level_End_Dt,
+	Elite_Category_Lvl_Cd,
+	Load_Dttm,
+	Publish_Dt,
+	Source_Data_Feed_Id
+)
+SELECT
+	Party_Id,
+	Party_Categ_Level_Start_Dt,
+	Party_Categ_Level_End_Dt,
+	Elite_Category_Lvl_Cd,
+    CAST('${LOAD_DTTM}' AS TIMESTAMP(0) FORMAT 'YYYYMMDDHHMISS') AS Load_Dttm,
+    Publish_Dt,
+    Source_Data_Feed_Id
+
+FROM VLTL_PARTY_CATEGORY_LEVEL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+END TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	ELIMINO TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_PARTY_CATEGORY_LEVEL;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	Actualizo estadísticas de la tabla de ODS
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS
+	COLUMN ( Party_Categ_Level_Start_Dt, Party_Id, Party_Categ_Level_End_Dt ),
+	COLUMN ( Party_Id ),
+	COLUMN ( Party_Categ_Level_Start_Dt ),
+	COLUMN ( Party_Categ_Level_End_Dt ),
+	COLUMN ( Elite_Category_Lvl_Cd ),
+	COLUMN ( PARTITION )
+ON ${PRMF_TERA_DB_ODS}.PARTY_ELITE_CATEGORY_LEVEL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/*** FIN BTEQ ***/
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+.LOGOFF
+.QUIT 0;
+FIN_BTEQ
+
+RT=$?
+if [ $RT != 0 ]
+then
+        tail -30 ${LOG_BTEQ}
+exit 1
+fi

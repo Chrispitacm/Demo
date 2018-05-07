@@ -1,0 +1,246 @@
+#!/usr/bin/ksh
+#####################################################################################
+# LATAM WCBI                                                                  		#
+# Nombre del proceso        : BTEQ_ODS_CUST_ELITE_CAT_LEVEL.bteq           	      	#
+# Descripcion del proceso   : Carga categorias FFP del Cliente                      #
+# Autor                     : Leonardo Angelucci                             		#
+# Empresa					: Teradata										 		#
+# Fecha                     : 13-04-2018                                     		#
+#####################################################################################
+
+. /data/DESA/app/PHBICI/CNF/ConfigLocal.sh
+
+PUB_DT=$1;                                                                           export PUB_DT;   # Fecha de Proceso
+LOAD_ID=$2;                                                                          export LOAD_ID;  # Id de Carga
+PUB_END_DT=$3;																		 export PUB_END_DT; # Fin Fecha de Proceso
+
+
+###############################################################################
+# VARIABLES LOCALES DEL PROCESO                                               #
+###############################################################################
+
+FECHA_HORA_PROCESO=`date +%Y%m%d"_"%H%M%S`;                                 export FECHA_HORA_PROCESO;   # Fecha/Hora del Proceso
+LOAD_DTTM=`date +%Y%m%d""%H%M%S`;                                          	export LOAD_DTTM;   		 # Fecha/Hora del Proceso (sin _)
+LOG_BTEQ=${PRMF_PATH_LOG}/BTEQ_ODS_CUST_ELITE_CAT_LEVEL_${FECHA_HORA_PROCESO}.log;  export LOG_BTEQ;             # Archivo Log del Proceso
+
+
+bteq<< FIN_BTEQ>${LOG_BTEQ}
+.LOGON ${PRMF_TERA_HOST}/${PRMF_TERA_USER},${PRMF_TERA_PASS}
+
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+SET QUERY_BAND = 'Proy=WCBI;BTEQ=BTEQ_ODS_CUST_ELITE_CAT_LEVEL;' FOR SESSION;
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/*** INICIO BTEQ ***/
+
+/* --------------------------------------------------------------------------------
+	CREO TABLAS VOLATILES DE TRABAJO PARA CARGAR LOS CATEGORIAS FFP ELITE EN ODS
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_ELITE_CATEGORY_LEVEL,
+NO FALLBACK,
+NO LOG
+(
+	  Elite_Category_Lvl_Cd SMALLINT NOT NULL
+	, Elite_Category_Lvl_Desc VARCHAR(50) CHARACTER SET LATIN NOT CASESPECIFIC NOT NULL
+	, Elite_Category_Lvl_Weight_Val SMALLINT NOT NULL
+    , Publish_Dt DATE Format 'YYYY-MM-DD' NOT NULL
+    , Source_Data_Feed_Id INTEGER NOT NULL
+)
+UNIQUE PRIMARY INDEX ( Elite_Category_Lvl_Cd )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL DE CATEGORIAS ELITE FFP EN ODS
+-----------------------------------------------------------------------------------*/
+
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.CATEGORY_LEVEL_TYPE FOR ACCESS
+
+INSERT INTO VLTL_ELITE_CATEGORY_LEVEL
+(
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT 
+   CASE 
+      Trim(Category_Level_Desc) 
+      WHEN 'BLACK SIGNATURE' THEN 1
+      WHEN 'BLACK' THEN 2
+      WHEN 'PLATINUM' THEN 3
+      WHEN 'GOLD' THEN 4
+      WHEN 'LATAM' THEN 5
+      ELSE 5+ (Row_Number() Over(PARTITION BY Category_Level_Desc ORDER BY Category_Level_Desc )) 
+   END AS Category_Level_Cd,
+   Category_Level_Desc,
+   CASE 
+      Trim(Category_Level_Desc) 
+      WHEN 'BLACK SIGNATURE' THEN 100
+      WHEN 'BLACK' THEN 90
+      WHEN 'PLATINUM' THEN 80
+      WHEN 'GOLD' THEN 70
+      WHEN 'LATAM' THEN 60
+      ELSE ( 5+ (Row_Number() Over(PARTITION BY Category_Level_Desc ORDER BY Category_Level_Desc )) )*-1
+   END AS Category_Level_Weight_Cd,
+   Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+   2038 AS Source_Data_Feed_Id
+
+FROM 
+   ${PRMF_TERA_DB_VTHIS}.CATEGORY_LEVEL_TYPE           
+
+WHERE 
+   Category_Type_Cd IN (7, 11)
+   
+GROUP BY 
+   Category_Level_Desc
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+INSERT INTO VLTL_ELITE_CATEGORY_LEVEL
+(
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+VALUES (-99, 'NO INFORMADO', 10, Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') ,2038)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+INSERT INTO VLTL_ELITE_CATEGORY_LEVEL
+(
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+VALUES (-98, 'NO APLICA', 9, Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') ,2038)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+INSERT INTO VLTL_ELITE_CATEGORY_LEVEL
+(
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+VALUES (-97, 'NO EXISTE', 8, Cast('${PUB_DT}' AS DATE Format 'YYYYMMDD') ,2038)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	COLECTO ESTADISTICAS A LA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS 
+   COLUMN (Elite_Category_Lvl_Cd),
+   COLUMN (PARTITION)
+ON VLTL_ELITE_CATEGORY_LEVEL;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ACTUALIZO LA TABLA  FINAL ODS CON INSERT / UPDATE, NO APLICA MERGE
+-----------------------------------------------------------------------------------*/
+
+BEGIN TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.ELITE_CATEGORY_LEVEL FOR ACCESS
+
+DELETE 
+FROM ${PRMF_TERA_DB_ODS}.ELITE_CATEGORY_LEVEL ALL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.ELITE_CATEGORY_LEVEL FOR ACCESS
+
+INSERT INTO ${PRMF_TERA_DB_ODS}.ELITE_CATEGORY_LEVEL
+(
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   Load_Dttm,
+   Publish_Dt,
+   Source_Data_Feed_Id
+)
+SELECT
+   Elite_Category_Lvl_Cd,
+   Elite_Category_Lvl_Desc,
+   Elite_Category_Lvl_Weight_Val,
+   CAST('${LOAD_DTTM}' AS TIMESTAMP(0) FORMAT 'YYYYMMDDHHMISS') AS Load_Dttm,
+   Publish_Dt,
+   Source_Data_Feed_Id
+
+FROM VLTL_ELITE_CATEGORY_LEVEL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+END TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	ELIMINO SEGUNDA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_ELITE_CATEGORY_LEVEL;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	Actualizo estadísticas de la tabla de ODS
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS
+	COLUMN ( Elite_Category_Lvl_Cd ),
+	COLUMN ( Elite_Category_Lvl_Weight_Val ),
+	COLUMN ( PARTITION )
+	
+ON ${PRMF_TERA_DB_ODS}.ELITE_CATEGORY_LEVEL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/*** FIN BTEQ ***/
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+.LOGOFF
+.QUIT 0;
+FIN_BTEQ
+
+RT=$?
+if [ $RT != 0 ]
+then
+        tail -30 ${LOG_BTEQ}
+exit 1
+fi

@@ -1,0 +1,205 @@
+#!/usr/bin/ksh
+#####################################################################################
+# LATAM WCBI                                                                  		#
+# Nombre del proceso        : BTEQ_ODS_CUST_PARTY.bteq           	                #
+# Descripcion del proceso   : Carga cabecera de Cliente                             #
+# Autor                     : Leonardo Angelucci                             		#
+# Empresa					: Teradata										 		#
+# Fecha                     : 17-04-2018                                     		#
+#####################################################################################
+
+. /data/DESA/app/PHBICI/CNF/ConfigLocal.sh
+
+PUB_DT=$1;                                                                           export PUB_DT;   # Fecha de Proceso
+LOAD_ID=$2;                                                                          export LOAD_ID;  # Id de Carga
+PUB_END_DT=$3;																		 export PUB_END_DT; # Fin Fecha de Proceso
+
+
+###############################################################################
+# VARIABLES LOCALES DEL PROCESO                                               #
+###############################################################################
+
+FECHA_HORA_PROCESO=`date +%Y%m%d"_"%H%M%S`;                                 export FECHA_HORA_PROCESO;   # Fecha/Hora del Proceso
+LOAD_DTTM=`date +%Y%m%d""%H%M%S`;                                          	export LOAD_DTTM;   		 # Fecha/Hora del Proceso (sin _)
+LOG_BTEQ=${PRMF_PATH_LOG}/BTEQ_ODS_CUST_PARTY_${FECHA_HORA_PROCESO}.log;  export LOG_BTEQ;             # Archivo Log del Proceso
+
+
+bteq<< FIN_BTEQ>${LOG_BTEQ}
+.LOGON ${PRMF_TERA_HOST}/${PRMF_TERA_USER},${PRMF_TERA_PASS}
+
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+SET QUERY_BAND = 'Proy=WCBI;BTEQ=BTEQ_ODS_CUST_PARTY;' FOR SESSION;
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/*** INICIO BTEQ ***/
+
+/* --------------------------------------------------------------------------------
+	CREA LOOKUP DE MAESTRO DE CLIENTES 
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_PARTY,
+NO FALLBACK,
+NO Log
+(
+	Party_Id INTEGER NOT NULL,
+	Party_Type_Cd SMALLINT,
+	Party_Creation_Dt DATE Format 'YYYY-MM-DD',
+	Party_Update_Dttm TIMESTAMP(0)
+)
+PRIMARY INDEX ( Party_Type_Cd )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	QUITA SOLAPAMIENTOS PARA CADA PARTY_ID
+-----------------------------------------------------------------------------------*/
+
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.PARTY FOR ACCESS 
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL FOR ACCESS 
+
+INSERT INTO VLTL_PARTY
+(
+	Party_Id,
+	Party_Type_Cd,
+	Party_Creation_Dt,
+	Party_Update_Dttm
+)
+SELECT
+	SOURCE.Party_Id,
+	SOURCE.Party_Type_Cd,
+	SOURCE.Party_Creation_Dt,
+    Cast(Cast(SOURCE.Party_Update_Dttm AS VARCHAR(19)) AS TIMESTAMP(0)) AS Party_Update_Dttm
+	
+FROM ${PRMF_TERA_DB_VTHIS}.PARTY SOURCE
+
+INNER JOIN ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL  TARGET
+ON SOURCE.Party_Id = TARGET.Party_Id
+
+WHERE TARGET.Category_Type_Cd IN (7, 11)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+   
+
+/* --------------------------------------------------------------------------------
+	COLECTO ESTADISTICAS A LA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS 
+   COLUMN (Party_Type_Cd),
+   COLUMN (Party_Id),
+   COLUMN (Party_Creation_Dt),
+   COLUMN (Party_Update_Dttm),
+   COLUMN (PARTITION)
+ON VLTL_PARTY;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ACTUALIZO LA TABLA  FINAL ODS CON INSERT / UPDATE, NO APLICA MERGE
+-----------------------------------------------------------------------------------*/
+
+BEGIN TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.PARTY FOR ACCESS
+
+INSERT INTO ${PRMF_TERA_DB_ODS}.PARTY
+(
+	Party_Id,
+	Party_Type_Cd,
+	Party_Creation_Dt,
+	Party_Update_Dttm,
+	Load_Dttm,
+	Publish_Dt,
+	Source_Data_Feed_Id
+)
+SELECT
+	SOURCE.Party_Id,
+	SOURCE.Party_Type_Cd,
+	SOURCE.Party_Creation_Dt,
+	SOURCE.Party_Update_Dttm,
+    CAST('${LOAD_DTTM}' AS TIMESTAMP(0) FORMAT 'YYYYMMDDHHMISS') AS Load_Dttm,
+    CAST('${PUB_DT}' AS DATE Format 'YYYYMMDD') AS Publish_Dt,
+    2039 AS Source_Data_Feed_Id
+
+FROM VLTL_PARTY SOURCE
+
+LEFT JOIN ${PRMF_TERA_DB_ODS}.PARTY TARGET
+   ON SOURCE.Party_Id = TARGET.Party_Id
+   
+WHERE TARGET.Party_Id IS NULL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.PARTY FOR ACCESS
+
+UPDATE TARGET
+FROM VLTL_PARTY SOURCE, 
+${PRMF_TERA_DB_ODS}.PARTY TARGET
+SET Party_Type_Cd = SOURCE.Party_Type_Cd,
+	Party_Creation_Dt = SOURCE.Party_Creation_Dt,
+	Party_Update_Dttm = SOURCE.Party_Update_Dttm
+WHERE SOURCE.Party_Id = TARGET.Party_Id
+AND (
+    TARGET.Party_Type_Cd <> SOURCE.Party_Type_Cd
+OR
+	Coalesce(TARGET.Party_Creation_Dt, Cast('1900-01-01' AS DATE)) <> Coalesce(SOURCE.Party_Creation_Dt,Cast('1900-01-01'AS DATE))
+OR
+	Coalesce(TARGET.Party_Update_Dttm,Cast('1900-01-01 00:00:00' AS TIMESTAMP(0))) <> Coalesce(SOURCE.Party_Update_Dttm,Cast('1900-01-01 00:00:00' AS TIMESTAMP(0)))
+)
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+END TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	ELIMINO TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_PARTY;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	Actualizo estadísticas de la tabla de ODS
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS
+	COLUMN ( Party_Id ),
+	COLUMN ( Party_Type_Cd ),
+	COLUMN ( PARTITION )
+ON ${PRMF_TERA_DB_ODS}.PARTY
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/*** FIN BTEQ ***/
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+.LOGOFF
+.QUIT 0;
+FIN_BTEQ
+
+RT=$?
+if [ $RT != 0 ]
+then
+        tail -30 ${LOG_BTEQ}
+exit 1
+fi

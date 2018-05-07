@@ -1,0 +1,291 @@
+#!/usr/bin/ksh
+#####################################################################################
+# LATAM WCBI                                                                  		#
+# Nombre del proceso        : BTEQ_ODS_CUST_TRAVEL_ACCOUNT_DOCUMENT_PARTY.bteq     	#
+# Descripcion del proceso   : Relación Prime Ticket con Cliente                     #
+# Autor                     : Leonardo Angelucci                             		#
+# Empresa					: Teradata										 		#
+# Fecha                     : 16-04-2018                                     		#
+#####################################################################################
+
+. /data/DESA/app/PHBICI/CNF/ConfigLocal.sh
+
+PUB_DT=$1;                                                                           export PUB_DT;   # Fecha de Proceso
+LOAD_ID=$2;                                                                          export LOAD_ID;  # Id de Carga
+PUB_END_DT=$3;																		 export PUB_END_DT; # Fin Fecha de Proceso
+
+
+###############################################################################
+# VARIABLES LOCALES DEL PROCESO                                               #
+###############################################################################
+
+FECHA_HORA_PROCESO=`date +%Y%m%d"_"%H%M%S`;                                 export FECHA_HORA_PROCESO;   # Fecha/Hora del Proceso
+LOAD_DTTM=`date +%Y%m%d""%H%M%S`;                                          	export LOAD_DTTM;   		 # Fecha/Hora del Proceso (sin _)
+LOG_BTEQ=${PRMF_PATH_LOG}/BTEQ_ODS_CUST_TRAVEL_ACCOUNT_DOCUMENT_PARTY_${FECHA_HORA_PROCESO}.log;  export LOG_BTEQ;             # Archivo Log del Proceso
+
+
+bteq<< FIN_BTEQ>${LOG_BTEQ}
+.LOGON ${PRMF_TERA_HOST}/${PRMF_TERA_USER},${PRMF_TERA_PASS}
+
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+SET QUERY_BAND = 'Proy=WCBI;BTEQ=BTEQ_ODS_CUST_TRAVEL_ACCOUNT_DOCUMENT_PARTY;' FOR SESSION;
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/*** INICIO BTEQ ***/
+
+
+/* --------------------------------------------------------------------------------
+	CREO TABLAS VOLATILES DE TRABAJO PARA CARGAR CLIENTE, TICKET Y FECHA DE EMISION
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_BEHAVIOR_IDENT,
+NO FALLBACK,
+NO LOG
+(
+	Prime_Ticket_Num VARCHAR(15) CHARACTER SET LATIN NOT CASESPECIFIC NOT NULL,
+	Issue_Dt DATE FORMAT 'YYYY-MM-DD' NOT NULL,
+    Party_Id INTEGER NOT NULL,
+	Bhid_Weight_Val INTEGER,
+	Bhid_Proc_Dt DATE FORMAT 'YYYY-MM-DD'
+)
+PRIMARY INDEX ( Prime_Ticket_Num, Issue_Dt )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CARGA TABLA VOLATIL DE TICKET Y FECHA DE EMISION
+-----------------------------------------------------------------------------------*/
+
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.IDCLI_BEHAVIOR_IDENT FOR ACCESS
+LOCK TABLE ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL FOR ACCESS
+
+INSERT INTO VLTL_BEHAVIOR_IDENT
+(
+   Prime_Ticket_Num,
+   Issue_Dt,
+   Party_Id,
+   Bhid_Weight_Val,
+   Bhid_Proc_Dt
+)
+SELECT 
+   SUBSTR(SOURCE.BHID_NMR, 1, 13) AS Prime_Ticket_Num ,
+   SOURCE.BHID_DT AS Issue_Dt,
+   COALESCE(SOURCE.Party_Id,-98) AS Party_Id,
+   SOURCE.BHID_Weight_Value,
+   SOURCE.Bhid_Proc_Dt
+
+FROM ${PRMF_TERA_DB_VTHIS}.IDCLI_BEHAVIOR_IDENT SOURCE
+
+INNER JOIN ${PRMF_TERA_DB_VTHIS}.PARTY_CATEGORIES_LEVEL TARGET
+ON SOURCE.Party_Id = TARGET.Party_Id
+   
+WHERE 
+   Trim(SOURCE.IDNT_ID) = 5001 
+   AND RegExp_Instr( SOURCE.BHID_NMR , '^[0-9]{13}') > 0
+   AND TARGET.Category_Type_Cd IN (7, 11)
+
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	COLECTO ESTADISTICAS A LA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS 
+   COLUMN ( Prime_Ticket_Num, Issue_Dt ),
+   COLUMN ( Prime_Ticket_Num ),
+   COLUMN ( Issue_Dt ),
+   COLUMN ( Party_Id ),
+   COLUMN (PARTITION)
+ON VLTL_BEHAVIOR_IDENT;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	CREO TABLA VOLATIL PARA CRUCE DE VENTA CON CLIENTE
+-----------------------------------------------------------------------------------*/
+
+CREATE MULTISET VOLATILE TABLE VLTL_BEHAVIOR_IDENT_ISSUE_DATE,
+NO FALLBACK,
+NO LOG
+(
+	Prime_Ticket_Num VARCHAR(15) CHARACTER SET LATIN NOT CASESPECIFIC NOT NULL,
+	Issue_Dt DATE FORMAT 'YYYY-MM-DD' NOT NULL,
+    Party_Id INTEGER NOT NULL,
+	Bhid_Weight_Val INTEGER,
+    Publish_Dt DATE Format 'YYYY-MM-DD' NOT NULL,
+	Source_Data_Feed_Id INTEGER NOT NULL
+)
+UNIQUE PRIMARY INDEX ( Prime_Ticket_Num, Issue_Dt )
+ON COMMIT PRESERVE ROWS
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+INSERT INTO VLTL_BEHAVIOR_IDENT_ISSUE_DATE
+(
+	Prime_Ticket_Num,
+	Issue_Dt,
+    Party_Id,
+	Bhid_Weight_Val,
+    Publish_Dt,
+	Source_Data_Feed_Id
+)
+SELECT 
+	VTA.Prime_Ticket_Num,
+	VTA.Issue_Dt,
+    COALESCE(CUST.Party_Id,-98) AS Party_Id,
+	CUST.Bhid_Weight_Val,
+    VTA.Publish_Dt,
+	252 AS Source_Data_Feed_Id
+
+FROM  ${PRMF_TERA_DB_VTODS}.TRAVEL_ACCOUNTABLE_DOCUMENT VTA 
+
+INNER JOIN VLTL_BEHAVIOR_IDENT CUST
+	ON VTA.Prime_Ticket_Num = CUST.Prime_Ticket_Num
+
+WHERE 
+   VTA.Publish_Dt BETWEEN CAST('${PUB_DT}' AS DATE FORMAT 'YYYYMMDD')  
+   AND (SELECT CAST(CASE WHEN REGEXP_SIMILAR( '${PUB_END_DT}' , '^[0-9]{8}$', 'c' )=1 then '${PUB_END_DT}' else '${PUB_DT}' end   AS DATE FORMAT 'YYYYMMDD'))
+	
+QUALIFY ROW_NUMBER() OVER (PARTITION BY VTA.Prime_Ticket_Num ORDER BY ABS(VTA.Issue_Dt - CUST.Issue_Dt) ASC, CUST.Bhid_Weight_Val DESC, CUST.Bhid_Proc_Dt DESC ) = 1
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	COLECTO ESTADISTICAS A LA TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS 
+   COLUMN ( Prime_Ticket_Num, Issue_Dt ),
+   COLUMN ( Prime_Ticket_Num ),
+   COLUMN ( Issue_Dt ),
+   COLUMN ( Party_Id ),
+   COLUMN (PARTITION)
+ON VLTL_BEHAVIOR_IDENT_ISSUE_DATE;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ELIMINO TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_BEHAVIOR_IDENT;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/* --------------------------------------------------------------------------------
+	ACTUALIZO LA TABLA  FINAL ODS CON INSERT / UPDATE, NO APLICA MERGE
+-----------------------------------------------------------------------------------*/
+
+BEGIN TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY FOR ACCESS
+
+INSERT INTO ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY
+(
+	Prime_Ticket_Num,
+	Issue_Dt,
+	Party_Id,
+	Load_Dttm,
+	Publish_Dt,
+	Source_Data_Feed_Id
+)
+SELECT
+	SOURCE.Prime_Ticket_Num,
+	SOURCE.Issue_Dt,
+    SOURCE.Party_Id,
+	CAST('${LOAD_DTTM}' AS TIMESTAMP(0) FORMAT 'YYYYMMDDHHMISS') AS Load_Dttm,
+    SOURCE.Publish_Dt,
+	SOURCE.Source_Data_Feed_Id
+
+FROM VLTL_BEHAVIOR_IDENT_ISSUE_DATE SOURCE
+
+LEFT JOIN ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY TARGET
+   ON 	SOURCE.Prime_Ticket_Num = TARGET.Prime_Ticket_Num
+   AND 	SOURCE.Issue_Dt = TARGET.Issue_Dt
+
+WHERE TARGET.Prime_Ticket_Num IS NULL
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+LOCK TABLE ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY FOR ACCESS
+
+UPDATE TARGET
+FROM VLTL_BEHAVIOR_IDENT_ISSUE_DATE SOURCE,
+   ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY TARGET
+SET
+   Party_Id = SOURCE.Party_Id,
+   Load_Dttm = CAST('${LOAD_DTTM}' AS TIMESTAMP(0) FORMAT 'YYYYMMDDHHMISS'),
+   Publish_Dt = SOURCE.Publish_Dt
+WHERE 
+    	SOURCE.Prime_Ticket_Num = TARGET.Prime_Ticket_Num
+   AND 	SOURCE.Issue_Dt = TARGET.Issue_Dt
+   AND (
+           TARGET.Party_Id <> SOURCE.Party_Id
+   )
+
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+END TRANSACTION;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	ELIMINO TABLA VOLATIL
+-----------------------------------------------------------------------------------*/
+
+DROP TABLE VLTL_BEHAVIOR_IDENT_ISSUE_DATE;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+/* --------------------------------------------------------------------------------
+	Actualizo estadísticas de la tabla de ODS
+-----------------------------------------------------------------------------------*/
+
+COLLECT STATISTICS
+	COLUMN ( Prime_Ticket_Num, Issue_Dt  ),
+	COLUMN ( Prime_Ticket_Num  ),
+	COLUMN ( Issue_Dt  ),
+	COLUMN ( Party_Id ),
+	COLUMN ( PARTITION )
+ON ${PRMF_TERA_DB_ODS}.TRAVEL_ACCOUNT_DOCUMENT_PARTY
+;
+
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+
+/*** FIN BTEQ ***/
+
+SELECT CURRENT_TIMESTAMP(0);
+.IF ERRORCODE <> 0 THEN.QUIT ERRORCODE
+
+.LOGOFF
+.QUIT 0;
+FIN_BTEQ
+
+RT=$?
+if [ $RT != 0 ]
+then
+        tail -30 ${LOG_BTEQ}
+exit 1
+fi
